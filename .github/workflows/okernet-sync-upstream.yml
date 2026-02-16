@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.SYNC_PAT }}
 
-      - name: Sync upstream branch + tags
+      - name: Sync upstream and tag new releases
         id: sync
         env:
           UPSTREAM_URL: https://github.com/modoboa/modoboa.git
@@ -31,7 +31,6 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Determine default branch
           DEFAULT_BRANCH="$(git remote show origin | awk '/HEAD branch/ {print $NF}')"
           echo "Default branch: ${DEFAULT_BRANCH}"
 
@@ -39,25 +38,7 @@ jobs:
             git remote add upstream "${UPSTREAM_URL}"
           fi
 
-          # Snapshot existing tags before fetch
-          BEFORE_TAGS="$(git tag -l | sort)"
-
           git fetch upstream --prune --tags
-
-          # Detect new tags
-          AFTER_TAGS="$(git tag -l | sort)"
-          NEW_TAGS="$(comm -13 <(echo "$BEFORE_TAGS") <(echo "$AFTER_TAGS") || true)"
-
-          if [ -n "$NEW_TAGS" ]; then
-            echo "New tags from upstream:"
-            echo "$NEW_TAGS"
-            echo "new_tags<<EOF" >> "$GITHUB_OUTPUT"
-            echo "$NEW_TAGS" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
-          else
-            echo "No new tags."
-            echo "new_tags=" >> "$GITHUB_OUTPUT"
-          fi
 
           git checkout "${DEFAULT_BRANCH}"
 
@@ -68,15 +49,39 @@ jobs:
           }
 
           git push origin "${DEFAULT_BRANCH}"
-          git push origin --tags
 
-      - name: Trigger docker builds for new tags
-        if: steps.sync.outputs.new_tags != ''
+          # Find the latest upstream semver tag (fetched locally)
+          LATEST_UPSTREAM="$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+          echo "Latest upstream tag: ${LATEST_UPSTREAM:-none}"
+
+          # Check if this tag already exists on origin
+          if [ -n "$LATEST_UPSTREAM" ]; then
+            EXISTING="$(git ls-remote --tags origin "refs/tags/${LATEST_UPSTREAM}" 2>/dev/null || true)"
+            if [ -z "$EXISTING" ]; then
+              echo "New upstream release: ${LATEST_UPSTREAM}"
+
+              # Delete the upstream tag locally (it points to an upstream commit
+              # that does NOT contain our okernet/ custom files)
+              git tag -d "${LATEST_UPSTREAM}"
+
+              # Re-create the tag on OUR master HEAD (includes Dockerfiles etc.)
+              git tag -a "${LATEST_UPSTREAM}" -m "Release ${LATEST_UPSTREAM} (from upstream modoboa/modoboa)"
+              git push origin "${LATEST_UPSTREAM}"
+
+              echo "new_tag=${LATEST_UPSTREAM}" >> "$GITHUB_OUTPUT"
+            else
+              echo "Tag ${LATEST_UPSTREAM} already exists on origin; skipping."
+              echo "new_tag=" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No semver tags found."
+            echo "new_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger docker builds
+        if: steps.sync.outputs.new_tag != ''
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
-          # Only trigger for semver tags (skip random branch-like names)
-          echo "${{ steps.sync.outputs.new_tags }}" | grep -E '^v?[0-9]+\.[0-9]+' | while read -r tag; do
-            echo "Dispatching build workflow for tag: ${tag}"
-            gh workflow run okernet-docker-build-push.yml --ref "${tag}"
-          done
+          echo "Dispatching build workflow for tag: ${{ steps.sync.outputs.new_tag }}"
+          gh workflow run okernet-docker-build-push.yml --ref "${{ steps.sync.outputs.new_tag }}"
