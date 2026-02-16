@@ -91,7 +91,7 @@ jobs:
             ${{ steps.vars.outputs.namespace }}/${{ matrix.image_suffix }}
           tags: |
             type=raw,value=${{ steps.vars.outputs.version }}
-            type=raw,value=latest,enable=${{ steps.vars.outputs.is_latest == 'true' }}
+            type=raw,value=latest
           labels: |
             org.opencontainers.image.source=${{ github.repository }}
             org.opencontainers.image.version=${{ steps.vars.outputs.version }}
