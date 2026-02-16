@@ -1,0 +1,237 @@
+name: modoboa-prod
+
+volumes:
+  db_data:
+  redis_data:
+  modoboa_data:
+  modoboa_shared:
+  vmail_data:
+  postfix_spool:
+  certs:
+  acme_webroot:
+
+networks:
+  web:
+  mail:
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-modoboa}
+      POSTGRES_USER: ${DB_USER:-modoboa}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-CHANGEME_DB_PASSWORD}
+      TZ: ${TZ:-Europe/London}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks: [mail]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      TZ: ${TZ:-Europe/London}
+    volumes:
+      - redis_data:/data
+    networks: [mail]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # Creates a short-lived self-signed cert at /certs/live/* if nothing exists yet.
+  # This prevents Dovecot/Postfix from failing on the first boot before Let's Encrypt runs.
+  tls-bootstrap:
+    image: okernet/modoboa-tls-bootstrap:${TLS_BOOTSTRAP_TAG:-latest}
+    environment:
+      WEB_FQDN: ${WEB_FQDN:-mail.example.com}
+      TZ: ${TZ:-Europe/London}
+    volumes:
+      - certs:/certs
+    restart: "no"
+
+  # One-shot: create the Modoboa instance + migrate + collectstatic
+  # Run it via: docker compose --profile setup run --rm modoboa-init
+  modoboa-init:
+    image: okernet/modoboa:${MODOBOA_TAG:-latest}
+    profiles: ["setup"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/London}
+      DB_URL: ${DB_URL:-postgresql://modoboa:CHANGEME_DB_PASSWORD@db:5432/modoboa}
+      WEB_FQDN: ${WEB_FQDN:-mail.example.com}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-CHANGEME_DJANGO_SECRET_KEY}
+    volumes:
+      - modoboa_data:/data
+      - modoboa_shared:/shared
+    networks: [mail, web]
+    command: ["/scripts/init.sh"]
+
+  # One-shot: generate Postfix map files + write Postfix/Dovecot config into /shared (named volume)
+  # Run it via: docker compose --profile setup run --rm mail-config
+  mail-config:
+    image: okernet/modoboa:${MODOBOA_TAG:-latest}
+    profiles: ["setup"]
+    user: "0:0"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/London}
+      DB_HOST: db
+      DB_NAME: ${DB_NAME:-modoboa}
+      DB_USER: ${DB_USER:-modoboa}
+      DB_PASSWORD: ${DB_PASSWORD:-CHANGEME_DB_PASSWORD}
+      WEB_FQDN: ${WEB_FQDN:-mail.example.com}
+      MAIL_FQDN: ${MAIL_FQDN:-mail.example.com}
+      PRIMARY_DOMAIN: ${PRIMARY_DOMAIN:-example.com}
+      VMAIL_UID: ${VMAIL_UID:-5000}
+      VMAIL_GID: ${VMAIL_GID:-5000}
+    volumes:
+      - modoboa_data:/data
+      - modoboa_shared:/shared
+    networks: [mail]
+    stdin_open: true
+    tty: true
+    command: ["/scripts/mail-config.sh"]
+
+  modoboa:
+    image: okernet/modoboa:${MODOBOA_TAG:-latest}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/London}
+      DB_URL: ${DB_URL:-postgresql://modoboa:CHANGEME_DB_PASSWORD@db:5432/modoboa}
+    volumes:
+      - modoboa_data:/data
+      - modoboa_shared:/shared
+    networks: [mail, web]
+    # Refuse to start until the instance exists (forces the explicit setup step)
+    command: ["sh", "-lc", "test -f /data/instance/manage.py || { echo 'ERROR: Run setup: modoboa-init + mail-config.'; exit 1; } && cd /data/instance && exec gunicorn instance.wsgi:application --bind 0.0.0.0:8000 --workers ${WEB_WORKERS:-3} --timeout 120"]
+    restart: unless-stopped
+
+  rqworker:
+    image: okernet/modoboa:${MODOBOA_TAG:-latest}
+    depends_on:
+      - modoboa
+    environment:
+      TZ: ${TZ:-Europe/London}
+      DB_URL: ${DB_URL:-postgresql://modoboa:CHANGEME_DB_PASSWORD@db:5432/modoboa}
+    volumes:
+      - modoboa_data:/data
+    networks: [mail]
+    command: ["sh", "-lc", "test -f /data/instance/manage.py || { echo 'ERROR: missing instance'; exit 1; } && cd /data/instance && exec python manage.py rqworker"]
+    restart: unless-stopped
+
+  # Optional: run Modoboa mailbox FS operations (rename/delete) every minute (see Modoboa docs). :contentReference[oaicite:3]{index=3}
+  mailbox-ops:
+    image: okernet/modoboa:${MODOBOA_TAG:-latest}
+    profiles: ["mailbox-ops"]
+    depends_on:
+      - modoboa
+    user: "${VMAIL_UID:-5000}:${VMAIL_GID:-5000}"
+    environment:
+      TZ: ${TZ:-Europe/London}
+    volumes:
+      - modoboa_data:/data
+      - vmail_data:/var/lib/mail
+    networks: [mail]
+    command: ["sh", "-lc", "test -f /data/instance/manage.py || { echo 'ERROR: missing instance'; exit 1; } && cd /data/instance && while true; do python manage.py handle_mailbox_operations || true; sleep 60; done"]
+    restart: unless-stopped
+
+  nginx:
+    image: okernet/modoboa-nginx:${NGINX_TAG:-latest}
+    depends_on:
+      - modoboa
+    environment:
+      TZ: ${TZ:-Europe/London}
+      WEB_FQDN: ${WEB_FQDN:-mail.example.com}
+    volumes:
+      - modoboa_data:/data:ro
+      - certs:/etc/certs:ro
+      - acme_webroot:/var/www/acme
+    networks: [web]
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+
+  acme:
+    image: okernet/modoboa-acme:${ACME_TAG:-latest}
+    depends_on:
+      - nginx
+    environment:
+      TZ: ${TZ:-Europe/London}
+      WEB_FQDN: ${WEB_FQDN:-mail.example.com}
+      LE_EMAIL: ${LE_EMAIL:-admin@example.com}
+    volumes:
+      - certs:/certs
+      - acme_webroot:/var/www/acme
+    networks: [web]
+    restart: unless-stopped
+
+  dovecot:
+    image: okernet/modoboa-dovecot:${DOVECOT_TAG:-latest}
+    depends_on:
+      tls-bootstrap:
+        condition: service_started
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/London}
+    volumes:
+      - modoboa_shared:/shared
+      - vmail_data:/var/lib/mail
+      - postfix_spool:/var/spool/postfix
+      - certs:/etc/certs:ro
+    networks: [mail]
+    ports:
+      - "143:143"
+      - "993:993"
+      - "110:110"
+      - "995:995"
+      - "4190:4190"
+    restart: unless-stopped
+
+  postfix:
+    image: okernet/modoboa-postfix:${POSTFIX_TAG:-latest}
+    hostname: ${MAIL_FQDN:-mail.example.com}
+    depends_on:
+      tls-bootstrap:
+        condition: service_started
+      dovecot:
+        condition: service_started
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/London}
+      POSTFIX_MYHOSTNAME: ${MAIL_FQDN:-mail.example.com}
+      TLS_CERT: /etc/certs/live/fullchain.pem
+      TLS_KEY: /etc/certs/live/key.pem
+    volumes:
+      - modoboa_shared:/shared
+      - postfix_spool:/var/spool/postfix
+      - certs:/etc/certs:ro
+    networks: [mail]
+    ports:
+      - "25:25"
+      - "587:587"
+      - "465:465"
+    restart: unless-stopped

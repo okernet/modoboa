@@ -1,0 +1,109 @@
+name: okernet - Build & Push Docker images
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & Push (${{ matrix.image_suffix }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image_suffix: modoboa
+            dockerfile: okernet/docker/modoboa/Dockerfile
+          - image_suffix: modoboa-postfix
+            dockerfile: okernet/docker/postfix/Dockerfile
+          - image_suffix: modoboa-dovecot
+            dockerfile: okernet/docker/dovecot/Dockerfile
+          - image_suffix: modoboa-tls-bootstrap
+            dockerfile: okernet/docker/tls-bootstrap/Dockerfile
+          - image_suffix: modoboa-nginx
+            dockerfile: okernet/docker/nginx/Dockerfile
+          - image_suffix: modoboa-acme
+            dockerfile: okernet/docker/acme/Dockerfile
+
+    steps:
+      - name: Checkout (full history for tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute tags & latest
+        id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: modoboa/modoboa
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME}"
+          NS="${DOCKERHUB_NAMESPACE:-okernet}"
+
+          # Query upstream "latest release" tag_name
+          LATEST="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+            | jq -r '.tag_name')"
+
+          norm() { echo "$1" | sed 's/^v//'; }
+
+          if [ "$(norm "$VERSION")" = "$(norm "$LATEST")" ]; then
+            IS_LATEST="true"
+          else
+            IS_LATEST="false"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "namespace=${NS}" >> "$GITHUB_OUTPUT"
+          echo "upstream_latest=${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "is_latest=${IS_LATEST}" >> "$GITHUB_OUTPUT"
+
+          echo "Building ${NS}/${{ matrix.image_suffix }}:${VERSION} (latest? ${IS_LATEST}; upstream latest=${LATEST})"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ steps.vars.outputs.namespace }}/${{ matrix.image_suffix }}
+          tags: |
+            type=raw,value=${{ steps.vars.outputs.version }}
+            type=raw,value=latest,enable=${{ steps.vars.outputs.is_latest == 'true' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_VERSION=${{ steps.vars.outputs.version }}

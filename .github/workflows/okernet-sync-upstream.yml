@@ -1,0 +1,51 @@
+name: okernet - Sync upstream (modoboa/modoboa)
+
+on:
+  schedule:
+    # Every 6 hours
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [upstream-sync]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream branch + tags
+        env:
+          UPSTREAM_URL: https://github.com/modoboa/modoboa.git
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Determine default branch
+          DEFAULT_BRANCH="$(git remote show origin | awk '/HEAD branch/ {print $NF}')"
+          echo "Default branch: ${DEFAULT_BRANCH}"
+
+          if ! git remote | grep -q '^upstream$'; then
+            git remote add upstream "${UPSTREAM_URL}"
+          fi
+
+          git fetch upstream --prune --tags
+
+          git checkout "${DEFAULT_BRANCH}"
+
+          # Merge upstream default branch into ours
+          git merge --no-edit "upstream/${DEFAULT_BRANCH}" || {
+            echo "Merge failed (likely conflicts). Resolve manually in a PR or locally."
+            exit 1
+          }
+
+          git push origin "${DEFAULT_BRANCH}"
+          git push origin --tags
