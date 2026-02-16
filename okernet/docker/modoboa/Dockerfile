@@ -4,7 +4,6 @@ ARG PYTHON_VERSION=3.12
 FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 
 ARG BUILD_VERSION=0.0.0
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=${BUILD_VERSION}
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -31,7 +30,12 @@ WORKDIR /src
 COPY . /src
 
 # Build wheels for faster/cleaner runtime image
-RUN python -m pip install --upgrade pip wheel setuptools setuptools_scm[toml] \
+# Normalize BUILD_VERSION: setuptools_scm >= 9 requires PEP 440 (e.g. "master" is invalid)
+RUN SCM_VERSION="${BUILD_VERSION}"; \
+    SCM_VERSION="${SCM_VERSION#v}"; \
+    echo "$SCM_VERSION" | grep -qE '^[0-9]+\.' || SCM_VERSION="0.0.0.dev0"; \
+    export SETUPTOOLS_SCM_PRETEND_VERSION="$SCM_VERSION" \
+ && python -m pip install --upgrade pip wheel setuptools setuptools_scm[toml] \
  && python -m pip wheel --wheel-dir=/wheels ".[postgresql,ldap]" \
  && python -m pip wheel --wheel-dir=/wheels gunicorn
 
