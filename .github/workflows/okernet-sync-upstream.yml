@@ -22,6 +22,7 @@ jobs:
           token: ${{ secrets.SYNC_PAT }}
 
       - name: Sync upstream branch + tags
+        id: sync
         env:
           UPSTREAM_URL: https://github.com/modoboa/modoboa.git
         run: |
@@ -38,7 +39,25 @@ jobs:
             git remote add upstream "${UPSTREAM_URL}"
           fi
 
+          # Snapshot existing tags before fetch
+          BEFORE_TAGS="$(git tag -l | sort)"
+
           git fetch upstream --prune --tags
+
+          # Detect new tags
+          AFTER_TAGS="$(git tag -l | sort)"
+          NEW_TAGS="$(comm -13 <(echo "$BEFORE_TAGS") <(echo "$AFTER_TAGS") || true)"
+
+          if [ -n "$NEW_TAGS" ]; then
+            echo "New tags from upstream:"
+            echo "$NEW_TAGS"
+            echo "new_tags<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$NEW_TAGS" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "No new tags."
+            echo "new_tags=" >> "$GITHUB_OUTPUT"
+          fi
 
           git checkout "${DEFAULT_BRANCH}"
 
@@ -50,3 +69,14 @@ jobs:
 
           git push origin "${DEFAULT_BRANCH}"
           git push origin --tags
+
+      - name: Trigger docker builds for new tags
+        if: steps.sync.outputs.new_tags != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          # Only trigger for semver tags (skip random branch-like names)
+          echo "${{ steps.sync.outputs.new_tags }}" | grep -E '^v?[0-9]+\.[0-9]+' | while read -r tag; do
+            echo "Dispatching build workflow for tag: ${tag}"
+            gh workflow run okernet-docker-build-push.yml --ref "${tag}"
+          done
